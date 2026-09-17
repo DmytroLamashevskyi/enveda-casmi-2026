@@ -13,6 +13,35 @@ def rank_from_scores(candidate_ids: Sequence[Hashable], scores: Sequence[float])
     return [candidate_ids[i] for i in order]
 
 
+def fuse_rankings(
+    rankings: Mapping[str, Sequence[Hashable]],
+    weights: Mapping[str, float] | None = None,
+    k: float = 20.0,
+) -> Dict[Hashable, float]:
+    """Reciprocal Rank Fusion for independent ranking lists.
+
+    Unlike score-based fusion, each view/run may contain a different candidate set.
+    This makes it suitable for combining, for example, a 5 ppm run with a 20 ppm
+    run or a direct-spectrum run with a neutral-loss run.
+    """
+    if k < 0:
+        raise ValueError("k must be non-negative")
+
+    weights = dict(weights or {})
+    fused = defaultdict(float)
+
+    for view_name, ranking in rankings.items():
+        weight = float(weights.get(view_name, 1.0))
+        seen: set[Hashable] = set()
+        for rank, candidate in enumerate(ranking, start=1):
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            fused[candidate] += weight / (k + rank)
+
+    return dict(fused)
+
+
 def reciprocal_rank_fusion(
     candidate_ids: Sequence[Hashable],
     score_views: Mapping[str, Sequence[float]],
@@ -24,23 +53,15 @@ def reciprocal_rank_fusion(
     Formula per view: weight / (k + rank), rank starts at 1.
     Returns candidate -> fused score.
     """
-    if k < 0:
-        raise ValueError("k must be non-negative")
-
-    weights = dict(weights or {})
-    fused = defaultdict(float)
-
+    rankings = {}
     for view_name, scores in score_views.items():
         if len(scores) != len(candidate_ids):
             raise ValueError(
                 f"View '{view_name}' has {len(scores)} scores for {len(candidate_ids)} candidates"
             )
-        ranking = rank_from_scores(candidate_ids, scores)
-        weight = float(weights.get(view_name, 1.0))
-        for rank, candidate in enumerate(ranking, start=1):
-            fused[candidate] += weight / (k + rank)
+        rankings[view_name] = rank_from_scores(candidate_ids, scores)
 
-    return dict(fused)
+    return fuse_rankings(rankings, weights=weights, k=k)
 
 
 def fused_ranking(
@@ -50,6 +71,15 @@ def fused_ranking(
     k: float = 20.0,
 ):
     scores = reciprocal_rank_fusion(candidate_ids, score_views, weights=weights, k=k)
+    return sorted(scores, key=scores.get, reverse=True)
+
+
+def fused_ranking_from_lists(
+    rankings: Mapping[str, Sequence[Hashable]],
+    weights: Mapping[str, float] | None = None,
+    k: float = 20.0,
+):
+    scores = fuse_rankings(rankings, weights=weights, k=k)
     return sorted(scores, key=scores.get, reverse=True)
 
 
