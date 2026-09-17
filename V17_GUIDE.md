@@ -4,11 +4,11 @@
 
 ## Что мы меняем
 
-1. **Validation по молекулам, а не по спектрам.**
-   Одна молекула может иметь несколько MS/MS-спектров. Если часть её спектров попадёт в train, а часть в validation, метрика будет завышена. Поэтому разделяем данные по molecule key / InChIKey.
+1. **Validation по структурам, а не по спектрам.**
+   Одна и та же структура может иметь несколько MS/MS-спектров. Если часть её спектров попадёт в train, а часть в validation, метрика будет завышена. В текущем notebook стабильный structural key — `inchikey14`, поэтому split делаем по нему.
 
 2. **Pseudo Class-2 validation.**
-   Для validation-молекулы убираем её собственные спектры из spectral library, но оставляем структуру среди кандидатов. Это имитирует ситуацию «структура известна в базе, но эталонного спектра нет».
+   Для validation-структуры убираем её собственные спектры из spectral library, но оставляем структуру среди кандидатов. Это имитирует ситуацию «структура известна в базе, но эталонного спектра нет».
 
 3. **Несколько views одного спектра.**
    Вместо одного preprocessing считаем несколько вариантов:
@@ -27,49 +27,54 @@
    - Recall@100
    - MRR@25
 
-6. **`sample_submission.csv` — это контракт, а не просто пример.**
-   Финальный CSV строится в том же порядке `molecule_id`, что и sample-файл, и каждая строка получает ровно 25 SMILES через `;`. Мы не хардкодим число строк: Kaggle может подставить другой скрытый test set.
+6. **`sample_submission.csv` — это контракт, а не обучающие данные.**
+   Он задаёт колонки, список `molecule_id`, порядок строк и формат 25 SMILES через `;`. Правильных ответов в нём нет, поэтому качество модели мы улучшаем на pseudo-validation из `train.parquet`, а sample используем только для безопасной сборки финального CSV.
 
 ---
 
 ## Минимальный план запуска
 
-### Шаг 1. Сделать validation split
+### Шаг 1. Сделать pseudo Class-2 validation
 
-Выбери 15–20% уникальных молекул как validation. Никогда не дели по строкам parquet.
+Для текущего train используем `inchikey14`, потому что именно этот ключ использует spectral library/candidate pool notebook-а.
 
 ```python
-from src.validation import group_holdout_split
+from src.validation import make_pseudo_class2_split
 
-train_idx, val_idx = group_holdout_split(
+library_df, val_df = make_pseudo_class2_split(
     train_df,
-    group_col='molecule_id',  # заменить на стабильный molecule key, если есть InChIKey
+    key_col='inchikey14',
     val_fraction=0.20,
     random_state=42,
 )
 ```
 
-### Шаг 2. Построить pseudo Class-2 library
+Что произошло:
 
-Для validation molecule нельзя использовать её собственные reference spectra.
+- 80% уникальных структур остаются в spectral library;
+- 20% структур становятся query-примерами;
+- **ни одного спектра этих 20% нет в library**;
+- сами структуры можно оставить в candidate database — это и есть pseudo Class 2.
+
+### Шаг 2. Проверить отсутствие leakage
 
 ```python
-from src.validation import remove_validation_targets_from_library
+from src.validation import assert_no_group_leakage
 
-library_df = remove_validation_targets_from_library(
-    train_df.iloc[train_idx],
-    val_df=train_df.iloc[val_idx],
-    key_col='molecule_id',
+assert_no_group_leakage(
+    library_df,
+    val_df,
+    group_col='inchikey14',
 )
 ```
 
-Если split уже сделан корректно по molecule_id, эта функция почти ничего не меняет. Она оставлена как guard rail.
+Если assertion проходит, одна и та же структура не присутствует по обе стороны split.
 
 ### Шаг 3. Получить несколько ranking lists
 
-Не нужно полностью запускать pipeline 4 раза. Тяжёлые candidate features лучше посчитать один раз, а затем получить несколько score-векторов.
+Не нужно полностью запускать pipeline четыре раза. Тяжёлые candidate features лучше посчитать один раз, а затем получить несколько score-векторов.
 
-Пример views:
+Первый набор экспериментов:
 
 ```python
 views = {
@@ -81,7 +86,11 @@ views = {
 }
 ```
 
+Это не обязательные финальные веса/параметры. Их задача — проверить, действительно ли разные способы обработки ошибаются по-разному.
+
 ### Шаг 4. Объединить результаты
+
+Если все views используют один candidate pool:
 
 ```python
 from src.rank_fusion import reciprocal_rank_fusion
@@ -100,21 +109,44 @@ final_scores = reciprocal_rank_fusion(
 )
 ```
 
+Если это действительно независимые прогоны с разными candidate sets (например 5 ppm и 20 ppm), используем списки напрямую:
+
+```python
+from src.rank_fusion import fused_ranking_from_lists
+
+ranking = fused_ranking_from_lists(
+    {
+        'ppm_5': ranking_5ppm,
+        'ppm_10': ranking_10ppm,
+        'ppm_20': ranking_20ppm,
+    },
+    weights={'ppm_5': 1.1, 'ppm_10': 1.0, 'ppm_20': 0.8},
+    k=20,
+)
+```
+
 RRF не складывает raw scores. Для каждого view кандидат получает очки по позиции:
 
 `weight / (k + rank)`
 
-Это делает ensemble устойчивее, если у entropy score диапазон 0–1, а у другого метода шкала совсем другая.
-
 ### Шаг 5. Проверить метрики
 
-```python
-from src.validation import mrr_at_k, recall_at_k
+Для локального benchmark удобнее оценивать candidate keys (`inchikey14`), а не строку SMILES — так разные текстовые представления одной структуры не создают ложную ошибку.
 
-print('Recall@25:', recall_at_k(predictions, truth, 25))
-print('Recall@50:', recall_at_k(predictions, truth, 50))
-print('Recall@100:', recall_at_k(predictions, truth, 100))
-print('MRR@25:', mrr_at_k(predictions, truth, 25))
+```python
+from src.validation import evaluate_ranking, identity_truth
+
+truth = identity_truth(val_df, key_col='inchikey14')
+metrics = evaluate_ranking(predictions, truth)
+print(metrics)
+```
+
+Где `predictions` имеет вид:
+
+```python
+{
+    query_inchikey14: [candidate_key_1, candidate_key_2, ...]
+}
 ```
 
 ### Шаг 6. Собрать submission строго по sample-файлу
@@ -127,10 +159,10 @@ from src.submission import build_submission, validate_submission
 
 sample = pd.read_csv(SAMPLE)
 
-# predictions: molecule_id -> список SMILES в порядке от лучшего к худшему
+# predictions_for_test: molecule_id -> SMILES от лучшего к худшему
 submission = build_submission(
     sample_submission=sample,
-    predictions=predictions,
+    predictions=predictions_for_test,
     topk=25,
     fallback='CCO',
 )
@@ -139,12 +171,43 @@ validate_submission(submission, sample, topk=25)
 submission.to_csv('submission.csv', index=False)
 ```
 
-`build_submission()` делает четыре полезные вещи:
+`build_submission()`:
 
 - сохраняет **точно тот же порядок molecule_id**, что и sample;
-- убирает дубликаты SMILES в начале списка, чтобы не тратить позиции;
+- убирает дубликаты SMILES в начале списка, чтобы не тратить ranking slots;
 - дополняет список до 25 элементов, если кандидатов меньше;
-- падает с понятной ошибкой, если для какого-то molecule_id вообще забыли сформировать prediction.
+- падает с понятной ошибкой, если для какого-то molecule_id prediction отсутствует;
+- не хардкодит число test-молекул.
+
+---
+
+## Как мы улучшаем алгоритм «на основе примеров»
+
+`sample_submission.csv` не содержит правильных ответов. Поэтому реальные примеры для обучения/сравнения берём из `train.parquet` и сами превращаем часть train в скрытый экзамен.
+
+Для каждой идеи сравниваем **один и тот же validation split**:
+
+| Experiment | Что меняем | Зачем |
+|---|---|---|
+| E0 | текущий V16 | контрольная точка |
+| E1 | intensity floor 0.2% → 1% | проверить влияние слабых шумовых peaks |
+| E2 | intensity floor 2% | ещё более строгая очистка |
+| E3 | 5 / 10 / 20 ppm rankings + RRF | твоя идея нескольких прогонов |
+| E4 | direct fragment + neutral-loss ranking | получить другой тип ошибок |
+| E5 | E1–E4 fusion | проверить реальную пользу ensemble |
+
+Для каждого эксперимента сохраняем:
+
+```text
+Recall@25
+Recall@50
+Recall@100
+MRR@25
+runtime
+Top-10 overlap с baseline
+```
+
+Меняем **одну вещь за раз**. Если E1 хуже E0, выкидываем E1. Если E3 даёт тот же Top-10 почти везде — multi-ppm ensemble не нужен. Если Recall@100 хороший, а MRR плохой — тогда уже улучшаем ranker.
 
 ---
 
@@ -182,10 +245,10 @@ Recall@100 высокий, например 0.90, но MRR@25 низкий.
 
 Правильная последовательность:
 
-1. validation
+1. pseudo-validation
 2. candidate recall
 3. multi-view preprocessing
-4. rank fusion
+4. independent-run rank fusion
 5. sample-submission validation
 6. ranker upgrade
 7. formula gate
@@ -198,10 +261,10 @@ Recall@100 высокий, например 0.90, но MRR@25 низкий.
 
 V17 считается готовой, если:
 
-- validation split не содержит одну и ту же молекулу в train и validation;
+- validation split не содержит одну и ту же `inchikey14` в library и validation;
 - есть pseudo Class-2 evaluation;
 - считаются Recall@25/50/100 и MRR@25;
-- есть минимум 3 score views;
+- есть минимум 3 score views или независимых rankings;
 - есть RRF ensemble;
 - submission собирается через sample-файл и проходит format validation;
 - все параметры и результаты записываются в таблицу экспериментов;
