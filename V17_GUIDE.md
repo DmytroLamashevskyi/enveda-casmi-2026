@@ -27,6 +27,9 @@
    - Recall@100
    - MRR@25
 
+6. **`sample_submission.csv` — это контракт, а не просто пример.**
+   Финальный CSV строится в том же порядке `molecule_id`, что и sample-файл, и каждая строка получает ровно 25 SMILES через `;`. Мы не хардкодим число строк: Kaggle может подставить другой скрытый test set.
+
 ---
 
 ## Минимальный план запуска
@@ -114,6 +117,35 @@ print('Recall@100:', recall_at_k(predictions, truth, 100))
 print('MRR@25:', mrr_at_k(predictions, truth, 25))
 ```
 
+### Шаг 6. Собрать submission строго по sample-файлу
+
+Текущий sample-файл имеет две колонки: `molecule_id` и `smiles`. Поле `smiles` содержит 25 кандидатов, разделённых `;`. Не нужно вручную собирать DataFrame и надеяться, что порядок совпадёт.
+
+```python
+import pandas as pd
+from src.submission import build_submission, validate_submission
+
+sample = pd.read_csv(SAMPLE)
+
+# predictions: molecule_id -> список SMILES в порядке от лучшего к худшему
+submission = build_submission(
+    sample_submission=sample,
+    predictions=predictions,
+    topk=25,
+    fallback='CCO',
+)
+
+validate_submission(submission, sample, topk=25)
+submission.to_csv('submission.csv', index=False)
+```
+
+`build_submission()` делает четыре полезные вещи:
+
+- сохраняет **точно тот же порядок molecule_id**, что и sample;
+- убирает дубликаты SMILES в начале списка, чтобы не тратить позиции;
+- дополняет список до 25 элементов, если кандидатов меньше;
+- падает с понятной ошибкой, если для какого-то molecule_id вообще забыли сформировать prediction.
+
 ---
 
 ## Как понимать результаты
@@ -154,10 +186,11 @@ Recall@100 высокий, например 0.90, но MRR@25 низкий.
 2. candidate recall
 3. multi-view preprocessing
 4. rank fusion
-5. ranker upgrade
-6. formula gate
-7. external candidate expansion
-8. graph-edit generation
+5. sample-submission validation
+6. ranker upgrade
+7. formula gate
+8. external candidate expansion
+9. graph-edit generation
 
 ---
 
@@ -170,5 +203,6 @@ V17 считается готовой, если:
 - считаются Recall@25/50/100 и MRR@25;
 - есть минимум 3 score views;
 - есть RRF ensemble;
+- submission собирается через sample-файл и проходит format validation;
 - все параметры и результаты записываются в таблицу экспериментов;
 - public Kaggle submission выполняется только после локального улучшения.
